@@ -26,8 +26,6 @@ OK -- byte-for-byte
   py -3.12-32 voicemeeter_genius.py ...
   ```
 
-  No third-party packages are required.
-
 ---
 ### Installation
 1. Install [Python 3.12.3 32-bit](https://www.python.org/ftp/python/3.12.3/python-3.12.3.exe)
