@@ -15,7 +15,7 @@ OK -- byte-for-byte
 
 ## Requirements
 
-- **Windows**.
+- **Windows10** (maybe Win11... i dont test it on win11)
 - **32-bit Python 3.12+**. `Voicemeeter8Setup.exe` is a 32-bit PE,
   and we call the native hash `FUN_00402940` directly via `ctypes`,
   so a 64-bit interpreter will NOT work (`OSError: [WinError 193]`).
@@ -36,17 +36,21 @@ OK -- byte-for-byte
    py -3.12-32 -m pip install pefile
 ```
 3. Download and Place `Voicemeeter8Setup.exe` in KeyGen folder.
-     I think there is no need to explain why it is not included in the repository.
+
+   I think there is no need to explain why it is not included in the repository.
      However, you need `Voicemeeter8Setup.exe Version 3.1.2.2 (DECEMBER 2025)` 
      
      Hash`Voicemeeter8Setup.exe Version 3.1.2.2 (DECEMBER 2025)`:
+   
      SHA256: `11D1487736AAB346AD82FCC88568C06F01CF82B20E1831D18088FB89B469424B`
+   
      MD5: `10803E8A8AC3B803D9A269C7133187DB`
-     SHA1: `31610B59BA26A2693E276B2A8AD45B9F9213B92E`/
+   
+     SHA1: `31610B59BA26A2693E276B2A8AD45B9F9213B92E`
      
     Why is this necessary? 
 	The reason is simple... the script uses system calls from the installer.
-3. Gen Keys once
+4. Gen Keys once
 ```
 py -3.12-32 voicemeeter_genius.py now
 ```
