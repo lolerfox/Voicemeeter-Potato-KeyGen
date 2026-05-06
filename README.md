@@ -38,7 +38,8 @@ OK -- byte-for-byte
 3. Download and Place `Voicemeeter8Setup.exe` in KeyGen folder.
 
    I think there is no need to explain why it is not included in the repository.
-     However, you need `Voicemeeter8Setup.exe Version 3.1.2.2 (DECEMBER 2025)` 
+
+   However, you need `Voicemeeter8Setup.exe Version 3.1.2.2 (DECEMBER 2025)` 
      
      Hash`Voicemeeter8Setup.exe Version 3.1.2.2 (DECEMBER 2025)`:
    
@@ -50,7 +51,7 @@ OK -- byte-for-byte
      
     Why is this necessary? 
 	The reason is simple... the script uses system calls from the installer.
-4. Gen Keys once
+5. Gen Keys once
 ```
 py -3.12-32 voicemeeter_genius.py now
 ```
