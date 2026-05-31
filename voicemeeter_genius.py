@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import argparse
 import re
+import struct
 import sys
 import winreg
 from datetime import datetime
+from pathlib import Path
 
 from fun_0040fe70 import build_fe70_xor_body, parse_vb_check_inst_braced
 from fun_00410760 import fun_00410760
@@ -48,7 +50,7 @@ from voicemeeter_hash_native import (
     NativeFe70HashSession,
     _is_32bit_process,
 )
-from voicemeeter_query_local870 import query_voicemeeter_hd_inputs
+from voicemeeter_query_local870 import query_voicemeeter_hd_inputs, system_boot_drive_letter
 
 
 # --- helpers ------------------------------------------------------------------
@@ -336,6 +338,85 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_diagnose(args: argparse.Namespace) -> int:
+    """
+    Print everything that affects the hash on this PC — use on machines where
+    autostart writes a pair Voicemeeter rejects.
+    """
+    import getpass
+    import os
+
+    print("=== voicemeeter_genius diagnose ===")
+    print(f"Python: {sys.version.split()[0]} ({struct.calcsize('P') * 8}-bit process)")
+    if not _is_32bit_process():
+        print("WARN: not 32-bit Python — native hash / autostart will fail or use wrong interpreter")
+    print(f"Windows user: {getpass.getuser()!r}")
+    print(f"SystemRoot: {os.environ.get('SystemRoot', '?')!r}")
+
+    drive = args.drive or system_boot_drive_letter()
+    print(f"Boot drive letter: {drive!r}")
+
+    try:
+        label, serial = query_voicemeeter_hd_inputs(drive)
+        print(f"HD label (local_870): {label!r}")
+        print(f"HD serial (local_3834): 0x{serial:08X}")
+        print(f"HD string: HD:{label}(0x{serial:08X})")
+    except OSError as e:
+        print(f"FAIL disk query: {e!r}")
+        label, serial = "", 0
+
+    prefix = args.prefix or detect_install_prefix()
+    print(f"Hash prefix (install path): {prefix!r}")
+    print(f"Prefix file exists: {os.path.isfile(prefix)}")
+    print(f"Native EXE: {args.exe!r} exists={os.path.isfile(args.exe)}")
+
+    found = read_registry_pair()
+    if not found:
+        print("\nRegistry: no Voicemeeter uninstall key with vbDateInst/vbCheckInst")
+    else:
+        for loc, d, c, uninst in found:
+            print(f"\nRegistry [{loc}]")
+            print(f"  vbDateInst  = {d!r}")
+            print(f"  vbCheckInst = {c!r}")
+            print(f"  UninstallString = {uninst!r}")
+            if not (d and c):
+                continue
+            try:
+                when = parse_date_arg(d)
+                target = parse_vb_check_inst_braced(c)
+                body, digest, seed = compute_hash(when, label, serial, args.exe, prefix)
+                got = _format_braced(digest)
+                ok = digest == target
+                print(f"  Recompute for registry date: {got}")
+                print(f"  Match registry hash: {'YES' if ok else 'NO'}")
+                if not ok:
+                    print("  -> Wrong label, serial, prefix, or Voicemeeter8Setup.exe build on this PC.")
+            except Exception as e:
+                print(f"  Recompute failed: {e!r}")
+
+    when_now = datetime.now()
+    try:
+        _, digest_now, _ = compute_hash(when_now, label, serial, args.exe, prefix)
+        print(f"\nIf autostart used --fresh (now): { _format_braced(digest_now) }")
+        print(f"  vbDateInst would be: {fmt_date_arg(when_now)!r}")
+    except Exception as e:
+        print(f"\nCannot compute 'now' pair: {e!r}")
+
+    log_path = Path(args.exe).resolve().parent / "voicemeeter_autostart.log"
+    if log_path.is_file():
+        print(f"\nLast lines of {log_path}:")
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines[-15:]:
+                print(f"  {line}")
+        except OSError:
+            pass
+    else:
+        print(f"\nNo autostart log at {log_path}")
+
+    return 0
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     when = datetime(2026, 1, 8, 12, 54, 56, 518_000)
     prefix = _resolve_prefix(args)
@@ -417,6 +498,12 @@ def main() -> int:
     _add_prefix(s)
     _add_exe(s)
     s.set_defaults(func=cmd_selftest)
+
+    d = sp.add_parser("diagnose", help="Why autostart / hash may fail on this PC")
+    d.add_argument("--drive", default=None, help="Boot drive letter (default: from %SystemRoot%)")
+    _add_prefix(d)
+    _add_exe(d)
+    d.set_defaults(func=cmd_diagnose)
 
     args = p.parse_args()
     return args.func(args)

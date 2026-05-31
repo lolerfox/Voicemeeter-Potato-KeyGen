@@ -16,6 +16,7 @@ dwDesiredAccess=0 (query only) works without admin on typical setups.
 from __future__ import annotations
 
 import ctypes
+import os
 import struct
 import sys
 from ctypes import wintypes
@@ -74,6 +75,15 @@ SetupDiGetDeviceInterfaceDetailA.restype = wintypes.BOOL
 SetupDiDestroyDeviceInfoList = setupapi.SetupDiDestroyDeviceInfoList
 SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
 SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+
+
+def system_boot_drive_letter() -> str:
+    """Drive letter where %SystemRoot% lives (usually C:, not always)."""
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    letter = os.path.splitdrive(root)[0]
+    if letter and len(letter) >= 2 and letter[1] == ":":
+        return letter[0].upper()
+    return "C"
 
 
 def _get_device_number_for_drive(drive_letter: str) -> tuple[int, int, int] | None:
@@ -229,10 +239,20 @@ def query_voicemeeter_hd_inputs(drive_letter: str = "C") -> tuple[str, int]:
 
     paths = _enumerate_disk_paths(guid)
     local_870 = ""
+    matched = 0
     for dp, ni, fn in paths:
         if ni is not None and ni[1] == drive_num:
-            local_870 = fn  # SPDRP_FRIENDLYNAME, same as FUN_004100D0
-            break
+            matched += 1
+            if fn:
+                local_870 = fn  # SPDRP_FRIENDLYNAME, same as FUN_004100D0
+            elif not local_870:
+                local_870 = ""
+
+    if matched == 0:
+        raise OSError(
+            f"no disk interface matched device number {drive_num} for drive {drive_letter}:"
+            f" (enumerated {len(paths)} interfaces)"
+        )
 
     # Volume serial from GetVolumeInformationA on "X:\"
     label_buf = ctypes.create_string_buffer(0x80)
@@ -247,12 +267,17 @@ def query_voicemeeter_hd_inputs(drive_letter: str = "C") -> tuple[str, int]:
         ctypes.c_char_p, wintypes.DWORD,
     ]
     GetVolumeInformationA.restype = wintypes.BOOL
-    GetVolumeInformationA(
-        f"{drive_letter}:\\".encode("ascii"),
+    vol_root = f"{drive_letter}:\\".encode("ascii")
+    ok = GetVolumeInformationA(
+        vol_root,
         label_buf, 0x80,
         ctypes.byref(serial),
         None, None, None, 0,
     )
+    if not ok:
+        raise OSError(
+            f"GetVolumeInformationA({vol_root!r}) failed: winerr={ctypes.get_last_error()}"
+        )
 
     return local_870, int(serial.value)
 
