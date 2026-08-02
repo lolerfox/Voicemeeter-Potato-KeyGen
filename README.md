@@ -17,7 +17,7 @@ OK -- byte-for-byte
 
 - **Windows 10** (maybe Win11... i dont test it on win11)
 - **32-bit Python 3.12+**. `Voicemeeter8Setup.exe` is a 32-bit PE,
-  and we call the native hash `FUN_00402940` directly via `ctypes`,
+  and call the native hash `FUN_00402940` directly via `ctypes`,
   so a 64-bit interpreter will NOT work (`OSError: [WinError 193]`).
   Any 3.12/3.13/3.14+ 32-bit build works — just make sure the `-32` tag
   matches whatever version you actually installed.
