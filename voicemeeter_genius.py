@@ -37,18 +37,24 @@ from __future__ import annotations
 
 import argparse
 import re
+import struct
 import sys
 import winreg
 from datetime import datetime
+from pathlib import Path
 
 from fun_0040fe70 import build_fe70_xor_body, parse_vb_check_inst_braced
 from fun_00410760 import fun_00410760
 from voicemeeter_hash_native import (
     DEFAULT_EXE,
+    KNOWN_GOOD_EXE_VERSIONS,
     NativeFe70HashSession,
     _is_32bit_process,
+    _py32_launcher_tag,
+    _pip_install_hint,
+    get_exe_version,
 )
-from voicemeeter_query_local870 import query_voicemeeter_hd_inputs
+from voicemeeter_query_local870 import query_voicemeeter_hd_inputs, system_boot_drive_letter
 
 
 # --- helpers ------------------------------------------------------------------
@@ -210,8 +216,10 @@ def compute_hash(
     """
     if not _is_32bit_process():
         raise RuntimeError(
-            "Native hash needs a 32-bit Python process "
-            "(Voicemeeter8Setup.exe is a 32-bit PE). Run with `py -3.12-32`."
+            f"Native hash needs a 32-bit Python process (Voicemeeter8Setup.exe is a "
+            f"32-bit PE). Currently running {struct.calcsize('P') * 8}-bit Python "
+            f"{sys.version_info.major}.{sys.version_info.minor}. Install the 32-bit build "
+            f"of that version and run with: py {_py32_launcher_tag()} ..."
         )
     prefix_bytes = prefix.encode("ascii", errors="replace")
     body = build_fe70_xor_body(prefix_bytes, when, hd_label=label, hd_id=serial)
@@ -336,6 +344,90 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_diagnose(args: argparse.Namespace) -> int:
+    """
+    Print everything that affects the hash on this PC — use on machines where
+    autostart writes a pair Voicemeeter rejects.
+    """
+    import getpass
+    import os
+
+    print("=== voicemeeter_genius diagnose ===")
+    print(f"Python: {sys.version.split()[0]} ({struct.calcsize('P') * 8}-bit process)")
+    if not _is_32bit_process():
+        print("WARN: not 32-bit Python — native hash / autostart will fail or use wrong interpreter")
+    print(f"Windows user: {getpass.getuser()!r}")
+    print(f"SystemRoot: {os.environ.get('SystemRoot', '?')!r}")
+
+    drive = args.drive or system_boot_drive_letter()
+    print(f"Boot drive letter: {drive!r}")
+
+    try:
+        label, serial = query_voicemeeter_hd_inputs(drive)
+        print(f"HD label (local_870): {label!r}")
+        print(f"HD serial (local_3834): 0x{serial:08X}")
+        print(f"HD string: HD:{label}(0x{serial:08X})")
+    except OSError as e:
+        print(f"FAIL disk query: {e!r}")
+        label, serial = "", 0
+
+    prefix = args.prefix or detect_install_prefix()
+    print(f"Hash prefix (install path): {prefix!r}")
+    print(f"Prefix file exists: {os.path.isfile(prefix)}")
+    print(f"Native EXE: {args.exe!r} exists={os.path.isfile(args.exe)}")
+    exe_version = get_exe_version(args.exe) if os.path.isfile(args.exe) else None
+    print(
+        f"Native EXE version: {exe_version or 'unknown'} "
+        f"(verified: {', '.join(sorted(KNOWN_GOOD_EXE_VERSIONS))})"
+    )
+
+    found = read_registry_pair()
+    if not found:
+        print("\nRegistry: no Voicemeeter uninstall key with vbDateInst/vbCheckInst")
+    else:
+        for loc, d, c, uninst in found:
+            print(f"\nRegistry [{loc}]")
+            print(f"  vbDateInst  = {d!r}")
+            print(f"  vbCheckInst = {c!r}")
+            print(f"  UninstallString = {uninst!r}")
+            if not (d and c):
+                continue
+            try:
+                when = parse_date_arg(d)
+                target = parse_vb_check_inst_braced(c)
+                body, digest, seed = compute_hash(when, label, serial, args.exe, prefix)
+                got = _format_braced(digest)
+                ok = digest == target
+                print(f"  Recompute for registry date: {got}")
+                print(f"  Match registry hash: {'YES' if ok else 'NO'}")
+                if not ok:
+                    print("  -> Wrong label, serial, prefix, or Voicemeeter8Setup.exe build on this PC.")
+            except Exception as e:
+                print(f"  Recompute failed: {e!r}")
+
+    when_now = datetime.now()
+    try:
+        _, digest_now, _ = compute_hash(when_now, label, serial, args.exe, prefix)
+        print(f"\nIf autostart used --fresh (now): { _format_braced(digest_now) }")
+        print(f"  vbDateInst would be: {fmt_date_arg(when_now)!r}")
+    except Exception as e:
+        print(f"\nCannot compute 'now' pair: {e!r}")
+
+    log_path = Path(args.exe).resolve().parent / "voicemeeter_autostart.log"
+    if log_path.is_file():
+        print(f"\nLast lines of {log_path}:")
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines[-15:]:
+                print(f"  {line}")
+        except OSError:
+            pass
+    else:
+        print(f"\nNo autostart log at {log_path}")
+
+    return 0
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     when = datetime(2026, 1, 8, 12, 54, 56, 518_000)
     prefix = _resolve_prefix(args)
@@ -374,6 +466,38 @@ def _add_prefix(p: argparse.ArgumentParser) -> None:
             "C:\\Program Files (x86)\\VB\\Voicemeeter\\Voicemeeter8Setup.exe."
         ),
     )
+
+
+# --- environment sanity check ---------------------------------------------------
+
+# Commands that fall over without a usable native-hash environment (32-bit Python
+# + pefile). These fail fast with a clear message instead of a raw traceback.
+_HARD_NATIVE_CMDS = {"gen", "now", "validate"}
+# Commands that already degrade gracefully (selftest skips the native part;
+# diagnose reports failures per-item) — for these we only warn, then continue.
+_SOFT_NATIVE_CMDS = {"selftest", "diagnose"}
+
+
+def _check_native_environment() -> str | None:
+    """Return a human-readable problem description, or None if the environment looks fine."""
+    if not _is_32bit_process():
+        return (
+            f"Running {struct.calcsize('P') * 8}-bit Python {sys.version_info.major}."
+            f"{sys.version_info.minor}, but Voicemeeter8Setup.exe is a 32-bit PE and can only "
+            f"be loaded from a 32-bit interpreter.\n"
+            f"  Install the 32-bit build of Python {sys.version_info.major}.{sys.version_info.minor} "
+            f"and run with:\n"
+            f"    py {_py32_launcher_tag()} voicemeeter_genius.py ..."
+        )
+    try:
+        import pefile  # noqa: F401
+    except ImportError:
+        return (
+            f"Module 'pefile' is not installed for this interpreter ({sys.executable}).\n"
+            f"  Install it with:\n"
+            f"    {_pip_install_hint('pefile')}"
+        )
+    return None
 
 
 def main() -> int:
@@ -418,7 +542,22 @@ def main() -> int:
     _add_exe(s)
     s.set_defaults(func=cmd_selftest)
 
+    d = sp.add_parser("diagnose", help="Why autostart / hash may fail on this PC")
+    d.add_argument("--drive", default=None, help="Boot drive letter (default: from %%SystemRoot%%)")
+    _add_prefix(d)
+    _add_exe(d)
+    d.set_defaults(func=cmd_diagnose)
+
     args = p.parse_args()
+
+    problem = _check_native_environment()
+    if problem:
+        if args.cmd in _HARD_NATIVE_CMDS:
+            print(f"ERROR: cannot compute the native hash on this interpreter.\n\n{problem}", file=sys.stderr)
+            return 2
+        if args.cmd in _SOFT_NATIVE_CMDS:
+            print(f"WARN: {problem}\n", file=sys.stderr)
+
     return args.func(args)
 
 

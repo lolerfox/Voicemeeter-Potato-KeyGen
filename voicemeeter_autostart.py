@@ -1,21 +1,26 @@
 """
-Background helper that refreshes vbDateInst / vbCheckInst at logon.
+Background helper that refreshes vbCheckInst at logon (and vbDateInst only when needed).
 
 Scheduled by install_autostart.bat via Task Scheduler. One pass:
 
-  1. Read the current wall clock.
-  2. Auto-detect hd_label / hd_serial for the system drive.
-  3. Read the hash prefix from the Voicemeeter ARP key (UninstallString).
+  1. Read vbDateInst from registry when present (rehash that timestamp); otherwise use now.
+  2. Auto-detect hd_label / hd_serial for the %SystemRoot% drive (not always C:).
+  3. Read the hash prefix from UninstallString on the Voicemeeter ARP key.
   4. Digest via native FUN_00402940.
-  5. Rewrite vbDateInst and vbCheckInst under HKLM\\…\\Uninstall\\VB:Voicemeeter …
+  5. Write vbDateInst + vbCheckInst (skipped if disk query failed — see log).
 
-Log file lives next to this script: voicemeeter_autostart.log.
+Log: voicemeeter_autostart.log next to this script.
 
-We swallow unexpected exceptions, log them, and still return exit 0 from main so
-Task Scheduler does not mark the task as failed on benign issues.
+Manual flags:
+  --fresh     always use current time for vbDateInst
+  --dry-run   compute and log only, do not write the registry
 """
 from __future__ import annotations
 
+import argparse
+import ctypes
+import getpass
+import os
 import sys
 import traceback
 import winreg
@@ -27,12 +32,18 @@ sys.path.insert(0, str(_HERE))
 
 from voicemeeter_genius import (  # noqa: E402
     _REG_LOCATIONS,
+    _check_native_environment,
     _format_braced,
     compute_hash,
     detect_install_prefix,
     fmt_date_arg,
+    parse_date_arg,
 )
-from voicemeeter_query_local870 import query_voicemeeter_hd_inputs  # noqa: E402
+from voicemeeter_hash_native import _py32_launcher_tag  # noqa: E402
+from voicemeeter_query_local870 import (  # noqa: E402
+    query_voicemeeter_hd_inputs,
+    system_boot_drive_letter,
+)
 
 
 _LOG = _HERE / "voicemeeter_autostart.log"
@@ -72,9 +83,31 @@ def write_pair(hive: int, sub: str, date_str: str, hash_str: str) -> None:
         winreg.SetValueEx(k, "vbCheckInst", 0, winreg.REG_SZ, hash_str)
 
 
-def run_once() -> int:
+def read_registry_date(hive: int, sub: str) -> datetime | None:
+    try:
+        with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            raw, _ = winreg.QueryValueEx(k, "vbDateInst")
+            if raw:
+                return parse_date_arg(str(raw))
+    except OSError:
+        pass
+    return None
+
+
+def run_once(*, fresh: bool = False, dry_run: bool = False) -> int:
+    user = getpass.getuser()
+    log(
+        f"START user={user!r} SystemRoot={os.environ.get('SystemRoot', '?')!r} "
+        f"fresh={fresh} dry_run={dry_run}"
+    )
+
     if not _EXE.is_file():
         log(f"FAIL: Voicemeeter8Setup.exe missing next to script ({_EXE})")
+        return 1
+
+    env_problem = _check_native_environment()
+    if env_problem:
+        log(f"FAIL: environment not usable for native hashing: {env_problem}")
         return 1
 
     hive, sub = find_target_key()
@@ -82,30 +115,58 @@ def run_once() -> int:
         log("FAIL: Voicemeeter uninstall key not found in registry")
         return 1
 
-    when = datetime.now()
+    existing = read_registry_date(hive, sub)
+    if fresh or existing is None:
+        when = datetime.now()
+        log("MODE fresh: vbDateInst from current clock")
+    else:
+        when = existing
+        log(f"MODE rehash: keeping vbDateInst={fmt_date_arg(when)!r}")
+
+    drive = system_boot_drive_letter()
+    label = ""
+    serial = 0
     try:
-        label, serial = query_voicemeeter_hd_inputs("C")
+        label, serial = query_voicemeeter_hd_inputs(drive)
+    except OSError as e:
+        err = ctypes.get_last_error()
+        log(
+            f"FAIL: disk query on drive {drive}: {e!r} winerr={err}. "
+            f"Registry not updated. Run: py {_py32_launcher_tag()} voicemeeter_genius.py diagnose"
+        )
+        return 1
     except Exception as e:
-        log(f"WARN: query_voicemeeter_hd_inputs failed: {e!r} — using empty label/serial")
-        label, serial = "", 0
+        log(f"FAIL: disk query unexpected error: {e!r}")
+        return 1
+
+    if not label:
+        log(
+            f"WARN: SPDRP_FRIENDLYNAME empty for boot drive {drive}: — "
+            "hash may still work if the installer also saw an empty name"
+        )
 
     prefix = detect_install_prefix()
+    if not os.path.isfile(prefix):
+        log(f"WARN: prefix path does not exist on disk: {prefix!r}")
 
     body, digest, seed = compute_hash(when, label, serial, str(_EXE), prefix)
     date_str = fmt_date_arg(when)
     hash_str = _format_braced(digest)
     log(
-        f"COMPUTED date={date_str} hash={hash_str} "
-        f"label={label!r} serial=0x{serial:08X} prefix={prefix!r}"
+        f"COMPUTED drive={drive} date={date_str} hash={hash_str} "
+        f"label={label!r} serial=0x{serial:08X} prefix={prefix!r} seed=0x{seed:08X}"
     )
+
+    if dry_run:
+        log("DRY-RUN: registry left unchanged")
+        return 0
 
     try:
         write_pair(hive, sub, date_str, hash_str)
     except OSError as e:
         log(
             f"FAIL: registry write to [{sub}] failed: {e!r}. "
-            "If you launched by hand, try an elevated shell. "
-            "Scheduled task should use /ru SYSTEM (see install_autostart.bat)."
+            "Run install_autostart.bat elevated so the task uses /ru SYSTEM."
         )
         return 1
 
@@ -114,8 +175,12 @@ def run_once() -> int:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Voicemeeter registry pair autostart helper")
+    ap.add_argument("--fresh", action="store_true", help="Set vbDateInst to now instead of reusing registry")
+    ap.add_argument("--dry-run", action="store_true", help="Log only, do not write registry")
+    args = ap.parse_args()
     try:
-        return run_once()
+        return run_once(fresh=args.fresh, dry_run=args.dry_run)
     except SystemExit:
         raise
     except BaseException as e:

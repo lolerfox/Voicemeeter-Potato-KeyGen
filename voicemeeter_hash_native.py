@@ -82,9 +82,58 @@ RVA_FUN_00402940 = 0x2940
 # First bytes of the function (sanity check that this is the build we expect)
 EXPECTED_FUN_HEAD = bytes.fromhex("558becb878810000e8")
 
+# Voicemeeter8Setup.exe builds this tool's RVA offsets and EXPECTED_FUN_HEAD were
+# reverse-engineered against. A different FileVersion doesn't guarantee a broken
+# offset, but it's the first thing to check if the prologue check below ever
+# starts failing after a VB-Audio update.
+KNOWN_GOOD_EXE_VERSIONS = {"3.1.2.2"}
+
+
+def get_exe_version(exe_path: str) -> str | None:
+    """Read FileVersion (fallback ProductVersion) from the PE's VERSIONINFO resource."""
+    try:
+        import pefile
+    except ImportError:
+        return None
+    try:
+        pe = pefile.PE(exe_path, fast_load=True)
+    except Exception:
+        return None
+    try:
+        pe.parse_data_directories(
+            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
+        )
+        for fileinfo in getattr(pe, "FileInfo", []):
+            for entry in fileinfo:
+                for st in getattr(entry, "StringTable", []):
+                    raw = st.entries.get(b"FileVersion") or st.entries.get(b"ProductVersion")
+                    if raw:
+                        text = raw.decode(errors="replace").strip()
+                        # Some VB6/Delphi-style builds store this as "3, 1, 2, 2" instead of "3.1.2.2".
+                        parts = re.split(r"[,\s]+", text)
+                        if len(parts) > 1 and all(p.isdigit() for p in parts):
+                            return ".".join(parts)
+                        return text
+    except Exception:
+        return None
+    finally:
+        pe.close()
+    return None
+
 
 def _is_32bit_process() -> bool:
     return struct.calcsize("P") == 4
+
+
+def _py32_launcher_tag() -> str:
+    """`py` launcher tag for the 32-bit build of *this* Python version, e.g. '-3.14-32'."""
+    v = sys.version_info
+    return f"-{v.major}.{v.minor}-32"
+
+
+def _pip_install_hint(package: str) -> str:
+    """Install hint for the *current* interpreter (used once we know we're 32-bit)."""
+    return f'"{sys.executable}" -m pip install {package}'
 
 
 def _write_u32(base: int, rva: int, value: int) -> None:
@@ -113,7 +162,8 @@ def bind_pe_imports(base: int, pe_path: str) -> None:
         import pefile
     except ImportError as e:
         raise OSError(
-            "pefile is required for native hashing: py -3.12-32 -m pip install pefile"
+            f"pefile is required for native hashing. Install it for this interpreter: "
+            f"{_pip_install_hint('pefile')}"
         ) from e
 
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -174,14 +224,25 @@ def bind_pe_imports(base: int, pe_path: str) -> None:
         pe.close()
 
 
-def _verify_fun_prologue(base: int) -> None:
+def _verify_fun_prologue(base: int, exe_path: str) -> None:
     addr = base + RVA_FUN_00402940
     buf = (ctypes.c_uint8 * len(EXPECTED_FUN_HEAD)).from_address(addr)
     got = bytes(buf)
     if got != EXPECTED_FUN_HEAD:
+        version = get_exe_version(exe_path) or "unknown"
         raise RuntimeError(
-            f"FUN_00402940 prologue mismatch (expected {EXPECTED_FUN_HEAD.hex()}, "
-            f"got {got.hex()}). Different installer build?"
+            f"FUN_00402940 prologue mismatch (expected {EXPECTED_FUN_HEAD.hex()}, got {got.hex()}).\n"
+            f"  Detected Voicemeeter8Setup.exe version: {version}\n"
+            f"  Verified against version(s): {', '.join(sorted(KNOWN_GOOD_EXE_VERSIONS))}\n"
+            f"  Different installer build — the RVA offsets this tool relies on may have moved."
+        )
+    version = get_exe_version(exe_path)
+    if version and version not in KNOWN_GOOD_EXE_VERSIONS:
+        print(
+            f"WARN: Voicemeeter8Setup.exe version {version} is not in the verified set "
+            f"({', '.join(sorted(KNOWN_GOOD_EXE_VERSIONS))}). The FUN_00402940 prologue still "
+            f"matched, but run 'validate --from-registry' to double-check the digest.",
+            file=sys.stderr,
         )
 
 
@@ -191,8 +252,10 @@ class NativeFe70HashSession:
     def __init__(self, exe_path: str = DEFAULT_EXE) -> None:
         if not _is_32bit_process():
             raise OSError(
-                "Need 32-bit Python: Voicemeeter8Setup.exe is 32-bit PE; a 64-bit "
-                "interpreter cannot LoadLibrary it (error 193)."
+                f"Need 32-bit Python: Voicemeeter8Setup.exe is 32-bit PE; a "
+                f"{struct.calcsize('P') * 8}-bit interpreter cannot LoadLibrary it (error 193). "
+                f"Install the 32-bit build of Python {sys.version_info.major}.{sys.version_info.minor} "
+                f"and run with: py {_py32_launcher_tag()} ..."
             )
         self.exe_path = exe_path
         self._h: int | None = None
@@ -213,7 +276,7 @@ class NativeFe70HashSession:
         _write_u32(base, RVA__DAT_00432D48, VAL__DAT_00432D48)
         _write_u32(base, RVA__DAT_00432D50, VAL__DAT_00432D50)
         _write_u32(base, RVA_DAT_004338F8, VAL_DAT_004338F8)
-        _verify_fun_prologue(base)
+        _verify_fun_prologue(base, self.exe_path)
         Fun = ctypes.CFUNCTYPE(
             None,
             wintypes.LPVOID,
@@ -254,13 +317,13 @@ def main() -> None:
         print(
             "You need 32-bit (x86) Python. Grab the \"Windows installer (32-bit)\" from python.org,\n"
             "then run this script with that interpreter explicitly, e.g.:\n"
-            r'  "C:\Users\YOU\AppData\Local\Programs\Python\Python312-32\python.exe" '
+            r'  "C:\Users\YOU\AppData\Local\Programs\Python\PythonXXX-32\python.exe" '
             f'"{__file__}" "{path}"\n'
             "\n"
             "With the stock py.exe launcher, list tags and pick the *-32 line:\n"
             "  py --list\n"
-            "Example:\n"
-            f'  py -3.12-32 "{__file__}" "{path}"\n'
+            "Example (32-bit build of the version you're running now):\n"
+            f'  py {_py32_launcher_tag()} "{__file__}" "{path}"\n'
             "\n"
             "\"Unknown option: -3\" usually means the `py` command in PATH is not the "
             "Python launcher, or you passed `-3` without an architecture tag.",
